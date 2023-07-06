@@ -8,7 +8,6 @@ export interface Result {
 
 export function getEtherscanApiUrl(network: string): string {
   let host = {
-    kovan: 'api-kovan.etherscan.io',
     rinkeby: 'api-rinkeby.etherscan.io',
     ropsten: 'api-ropsten.etherscan.io',
     goerli: 'api-goerli.etherscan.io',
@@ -16,7 +15,11 @@ export function getEtherscanApiUrl(network: string): string {
     fuji: 'api-testnet.snowtrace.io',
     avalanche: 'api.snowtrace.io',
     mumbai: 'api-mumbai.polygonscan.com',
-    polygon: 'api.polygonscan.com'
+    polygon: 'api.polygonscan.com',
+    arbitrum: 'api.arbiscan.io',
+    'arbitrum-goerli': 'api-goerli.arbiscan.io',
+    'base-goerli': 'api-goerli.basescan.org',
+    'linea-goerli': 'api-goerli.lineascan.build'
   }[network];
 
   if (!host) {
@@ -28,7 +31,6 @@ export function getEtherscanApiUrl(network: string): string {
 
 export function getEtherscanUrl(network: string): string {
   let host = {
-    kovan: 'kovan.etherscan.io',
     rinkeby: 'rinkeby.etherscan.io',
     ropsten: 'ropsten.etherscan.io',
     goerli: 'goerli.etherscan.io',
@@ -37,6 +39,10 @@ export function getEtherscanUrl(network: string): string {
     avalanche: 'snowtrace.io',
     mumbai: 'mumbai.polygonscan.com',
     polygon: 'polygonscan.com',
+    arbitrum: 'arbiscan.io',
+    'arbitrum-goerli': 'goerli.arbiscan.io',
+    'base-goerli': 'goerli.basescan.org',
+    'linea-goerli': 'goerli.lineascan.build'
   }[network];
 
   if (!host) {
@@ -48,7 +54,6 @@ export function getEtherscanUrl(network: string): string {
 
 export function getEtherscanApiKey(network: string): string {
   let apiKey = {
-    kovan: process.env.ETHERSCAN_KEY,
     rinkeby: process.env.ETHERSCAN_KEY,
     ropsten: process.env.ETHERSCAN_KEY,
     goerli: process.env.ETHERSCAN_KEY,
@@ -57,6 +62,10 @@ export function getEtherscanApiKey(network: string): string {
     avalanche: process.env.SNOWTRACE_KEY,
     mumbai: process.env.POLYGONSCAN_KEY,
     polygon: process.env.POLYGONSCAN_KEY,
+    arbitrum: process.env.ARBISCAN_KEY,
+    'arbitrum-goerli': process.env.ARBISCAN_KEY,
+    'base-goerli': process.env.ETHERSCAN_KEY,
+    'linea-goerli': process.env.LINEASCAN_KEY
   }[network];
 
   if (!apiKey) {

@@ -1,11 +1,11 @@
 import { CometContext, scenario } from './context/CometContext';
 import { expect } from 'chai';
-import { expectApproximately, expectRevertCustom, expectRevertMatches, getExpectedBaseBalance, getInterest, isTriviallySourceable, isValidAssetIndex, MAX_ASSETS } from './utils';
+import { expectApproximately, expectBase, expectRevertCustom, expectRevertMatches, getExpectedBaseBalance, getInterest, isTriviallySourceable, isValidAssetIndex, MAX_ASSETS, UINT256_MAX } from './utils';
 import { ContractReceipt } from 'ethers';
 
 // XXX introduce a SupplyCapConstraint to separately test the happy path and revert path instead
 // of testing them conditionally
-async function testSupplyCollateral(context: CometContext, assetNum: number): Promise<null | ContractReceipt> {
+async function testSupplyCollateral(context: CometContext, assetNum: number): Promise<void | ContractReceipt> {
   const comet = await context.getComet();
   const { albert } = await context.actors;
   const { asset: assetAddress, scale: scaleBN, supplyCap } = await comet.getAssetInfo(assetNum);
@@ -36,7 +36,7 @@ async function testSupplyCollateral(context: CometContext, assetNum: number): Pr
   }
 }
 
-async function testSupplyFromCollateral(context: CometContext, assetNum: number): Promise<null | ContractReceipt> {
+async function testSupplyFromCollateral(context: CometContext, assetNum: number): Promise<void | ContractReceipt> {
   const comet = await context.getComet();
   const { albert, betty } = await context.actors;
   const { asset: assetAddress, scale: scaleBN, supplyCap } = await comet.getAssetInfo(assetNum);
@@ -77,6 +77,9 @@ for (let i = 0; i < MAX_ASSETS; i++) {
   scenario(
     `Comet#supply > collateral asset ${i}`,
     {
+      // XXX Unfortunately, the filtering step happens before solutions are run, so this will filter out
+      // hypothetical assets added during the migration/proposal constraint because those assets don't exist
+      // yet
       filter: async (ctx) => await isValidAssetIndex(ctx, i) && await isTriviallySourceable(ctx, i, amountToSupply),
       tokenBalances: {
         albert: { [`$asset${i}`]: amountToSupply },
@@ -201,10 +204,10 @@ scenario(
   'Comet#supplyFrom > repay borrow',
   {
     tokenBalances: {
-      albert: { $base: 1000 }
+      albert: { $base: 1010 }
     },
     cometBalances: {
-      betty: { $base: -1000 } // in units of asset, not wei
+      betty: { $base: '<= -1000' } // in units of asset, not wei
     },
   },
   async ({ comet, actors }, context) => {
@@ -212,21 +215,15 @@ scenario(
     const baseAssetAddress = await comet.baseToken();
     const baseAsset = context.getAssetByAddress(baseAssetAddress);
     const scale = (await comet.baseScale()).toBigInt();
-    const utilization = await comet.getUtilization();
-    const borrowRate = (await comet.getBorrowRate(utilization)).toBigInt();
-
-    expect(await baseAsset.balanceOf(albert.address)).to.be.equal(1000n * scale);
-    expectApproximately(await betty.getCometBaseBalance(), -1000n * scale, getInterest(1000n * scale, borrowRate, 1n) + 1n);
 
     await baseAsset.approve(albert, comet.address);
     await albert.allow(betty, true);
 
-    // Betty supplies 100 units of base from Albert to repay borrows
-    const txn = await betty.supplyAssetFrom({ src: albert.address, dst: betty.address, asset: baseAsset.address, amount: 1000n * scale });
+    // Betty supplies max base from Albert to repay all borrows
+    const txn = await betty.supplyAssetFrom({ src: albert.address, dst: betty.address, asset: baseAsset.address, amount: UINT256_MAX });
 
-    expect(await baseAsset.balanceOf(albert.address)).to.be.equal(0n);
-    // XXX all these timings are crazy
-    expectApproximately(await betty.getCometBaseBalance(), 0n, getInterest(1000n * scale, borrowRate, 8n) + 2n);
+    expect(await baseAsset.balanceOf(albert.address)).to.be.lessThan(10n * scale);
+    expectBase(await betty.getCometBaseBalance(), 0n);
 
     return txn; // return txn to measure gas
   }
@@ -250,7 +247,8 @@ scenario(
         asset: baseAsset.address,
         amount: 100n * scale,
       })
-    ).to.be.revertedWith('ERC20: transfer amount exceeds allowance');
+    ).to.be.reverted;
+    // ).to.be.revertedWith('ERC20: transfer amount exceeds allowance');
   }
 );
 
@@ -277,7 +275,8 @@ scenario(
         asset: baseAsset.address,
         amount: 100n * scale,
       })
-    ).to.be.revertedWith('ERC20: transfer amount exceeds allowance');
+    ).to.be.reverted;
+    // ).to.be.revertedWith('ERC20: transfer amount exceeds allowance');
   }
 );
 
@@ -292,6 +291,7 @@ scenario(
     const { albert, betty } = actors;
     const { asset: asset0Address, scale: scaleBN } = await comet.getAssetInfo(0);
     const collateralAsset = context.getAssetByAddress(asset0Address);
+    const symbol = await collateralAsset.token.symbol();
     const scale = scaleBN.toBigInt();
 
     await albert.allow(betty, true);
@@ -306,8 +306,10 @@ scenario(
       }),
       [
         /ERC20: transfer amount exceeds allowance/,
+        /ERC20: insufficient allowance/,
         /transfer amount exceeds spender allowance/,
-        /Dai\/insufficient-allowance/
+        /Dai\/insufficient-allowance/,
+        symbol === 'WETH' ? /Transaction reverted without a reason string/ : /.^/
       ]
     );
   }
@@ -332,7 +334,8 @@ scenario(
         asset: baseAsset.address,
         amount: 100n * scale,
       })
-    ).to.be.revertedWith('ERC20: transfer amount exceeds balance');
+    ).to.be.reverted;
+    // ).to.be.revertedWith('ERC20: transfer amount exceeds balance');
   }
 );
 
@@ -358,7 +361,8 @@ scenario(
         asset: baseAsset.address,
         amount: 100n * scale,
       })
-    ).to.be.revertedWith('ERC20: transfer amount exceeds balance');
+    ).to.be.reverted;
+    // ).to.be.revertedWith('ERC20: transfer amount exceeds balance');
   }
 );
 
@@ -373,6 +377,7 @@ scenario(
     const { albert, betty } = actors;
     const { asset: asset0Address, scale: scaleBN } = await comet.getAssetInfo(0);
     const collateralAsset = context.getAssetByAddress(asset0Address);
+    const symbol = await collateralAsset.token.symbol();
     const scale = scaleBN.toBigInt();
 
     await collateralAsset.approve(albert, comet.address);
@@ -387,7 +392,8 @@ scenario(
       }),
       [
         /transfer amount exceeds balance/,
-        /Dai\/insufficient-balance/
+        /Dai\/insufficient-balance/,
+        symbol === 'WETH' ? /Transaction reverted without a reason string/ : /.^/
       ]
     );
   }

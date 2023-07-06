@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers';
-import { BigNumber, BigNumberish, Contract, ContractReceipt, Event, EventFilter, constants, utils } from 'ethers';
+import { BigNumber, BigNumberish, Contract, ContractReceipt, ContractTransaction, Event, EventFilter, constants, utils } from 'ethers';
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { CometContext } from '../context/CometContext';
@@ -13,10 +13,14 @@ import { debug } from '../../plugins/deployment_manager/Utils';
 import { COMP_WHALES } from '../../src/deploy';
 import relayMessage from './relayMessage';
 import { mineBlocks, setNextBaseFeeToZero, setNextBlockTimestamp } from './hreUtils';
+import { BaseBridgeReceiver, CometInterface } from '../../build/types';
+import CometActor from './../context/CometActor';
+import { isBridgeProposal } from './isBridgeProposal';
 
 export { mineBlocks, setNextBaseFeeToZero, setNextBlockTimestamp };
 
 export const MAX_ASSETS = 15;
+export const UINT256_MAX = 2n ** 256n - 1n;
 
 export interface ComparativeAmount {
   val: number;
@@ -38,32 +42,36 @@ export function abs(x: bigint): bigint {
   return x < 0n ? -x : x;
 }
 
-export function expectApproximately(expected: bigint, actual: bigint, precision: bigint = 0n) {
+export function expectApproximately(expected: bigint, actual: bigint, precision = 0n) {
   expect(BigNumber.from(abs(expected - actual))).to.be.lte(BigNumber.from(precision));
 }
 
+export function expectBase(expected: bigint, actual: bigint, precision = 2n) {
+  expectApproximately(expected, actual, precision);
+}
 
-export function expectRevertCustom(tx: Promise<ContractReceipt>, custom: string) {
+export function expectRevertCustom(tx: Promise<ContractReceipt | ContractTransaction>, custom: string) {
   return tx
     .then(_ => { throw new Error('Expected transaction to be reverted'); })
     .catch(e => {
       const selector = utils.keccak256(custom.split('').reduce((a, s) => a + s.charCodeAt(0).toString(16), '0x')).slice(2, 2 + 8);
       const patterns = [
-        new RegExp(`custom error '${custom.replace(/[()]/g, "\\$&")}'`),
+        new RegExp(`custom error '${custom.replace(/[()]/g, '\\$&')}'`),
         new RegExp(`unrecognized custom error with selector ${selector}`),
+        new RegExp(`unrecognized custom error \\(return data: 0x${selector}\\)`)
       ];
       for (const pattern of patterns)
-        if (pattern.test(e.message))
+        if (pattern.test(e.message) || pattern.test(e.reason))
           return;
-      throw new Error(`Expected revert message in one of ${patterns}, but reverted with: ${e.message}`);
+      throw new Error(`Expected revert message in one of [${patterns}], but reverted with: ${e.message}`);
     });
 }
 
-export function expectRevertMatches(tx: Promise<ContractReceipt>, patterns: RegExp | RegExp[]) {
+export function expectRevertMatches(tx: Promise<ContractReceipt>, patterns: RegExp[]) {
   return tx
     .then(_ => { throw new Error('Expected transaction to be reverted'); })
     .catch(e => {
-      for (const pattern of [].concat(patterns))
+      for (const pattern of patterns)
         if (pattern.test(e.message))
           return;
       throw new Error(`Expected revert message in one of ${patterns}, but reverted with: ${e.message}`);
@@ -103,7 +111,7 @@ export function requireNumber(o: object, key: string, err: string): number {
   return value;
 }
 
-export function optionalNumber(o: object, key: string): number {
+export function optionalNumber(o: object, key: string): number | undefined {
   let value: unknown = o[key];
   if (value === undefined) {
     return undefined;
@@ -142,6 +150,8 @@ export async function getActorAddressFromName(name: string, context: CometContex
     if (cometRegex.test(name)) {
       // If name matches regex, e.g. "$comet"
       actorAddress = (await context.getComet()).address;
+    } else {
+      throw new Error(`Invalid actor name: ${name}`);
     }
     return actorAddress;
   } else {
@@ -157,11 +167,13 @@ export async function getAssetFromName(name: string, context: CometContext): Pro
     let asset: string;
     if (collateralAssetRegex.test(name)) {
       // If name matches regex, e.g. "$asset10"
-      const assetIndex = name.match(/[0-9]+/g)[0];
+      const assetIndex = name.match(/[0-9]+/g)![0];
       ({ asset } = await comet.getAssetInfo(assetIndex));
     } else if (baseAssetRegex.test(name)) {
       // If name matches "base"
       asset = await comet.baseToken();
+    } else {
+      throw new Error(`Invalid asset name: ${name}`);
     }
     return context.getAssetByAddress(asset);
   } else {
@@ -179,11 +191,11 @@ export function getToTransferAmount(amount: ComparativeAmount, existingBalance: 
       break;
     case ComparisonOp.GTE:
       // `toTransfer` should not be negative
-      toTransfer = max(exp(amount.val, decimals) - existingBalance, 0);
+      toTransfer = max(exp(amount.val, decimals) - existingBalance, 0n);
       break;
     case ComparisonOp.LTE:
       // `toTransfer` should not be positive
-      toTransfer = min(exp(amount.val, decimals) - existingBalance, 0);
+      toTransfer = min(exp(amount.val, decimals) - existingBalance, 0n);
       break;
     case ComparisonOp.GT:
       toTransfer = exp(amount.val, decimals) - existingBalance + 1n;
@@ -206,11 +218,11 @@ export function parseAmount(amount): ComparativeAmount {
       return amount >= 0 ? { val: amount, op: ComparisonOp.GTE } : { val: amount, op: ComparisonOp.LTE };
     case 'string':
       return matchGroup(amount, {
-        'GTE': />=\s*(\d+)/,
-        'GT': />\s*(\d+)/,
-        'LTE': /<=\s*(\d+)/,
-        'LT': /<\s*(\d+)/,
-        'EQ': /==\s*(\d+)/,
+        'GTE': />=\s*(-?\d+)/,
+        'GT': />\s*(-?\d+)/,
+        'LTE': /<=\s*(-?\d+)/,
+        'LT': /<\s*(-?\d+)/,
+        'EQ': /==\s*(-?\d+)/,
       });
     case 'object':
       return amount;
@@ -257,6 +269,27 @@ export async function isBulkerSupported(ctx: CometContext): Promise<boolean> {
   return bulker == null ? false : true;
 }
 
+type DeploymentCriterion = {
+  network?: string;
+  deployment?: string;
+}
+
+export function matchesDeployment(ctx: CometContext, deploymentCriteria: DeploymentCriterion[]): boolean {
+  const currentDeployment = {
+    network: ctx.world.base.network,
+    deployment: ctx.world.base.deployment
+  };
+
+  function matchesCurrentDeployment(deploymentCriterion: DeploymentCriterion) {
+    for (const [k, v] of Object.entries(deploymentCriterion)) {
+      if (currentDeployment[k] !== v) return false;
+    }
+    return true;
+  }
+
+  return deploymentCriteria.some(matchesCurrentDeployment);
+}
+
 export async function isRewardSupported(ctx: CometContext): Promise<boolean> {
   const rewards = await ctx.getRewards();
   const comet = await ctx.getComet();
@@ -277,7 +310,7 @@ export async function fetchLogs(
   filter: EventFilter,
   fromBlock: number,
   toBlock: number,
-  BLOCK_SPAN = 2048 // NB: sadly max for fuji
+  BLOCK_SPAN = 2047 // NB: sadly max for fuji is LESS than 2048
 ): Promise<Event[]> {
   if (toBlock - fromBlock > BLOCK_SPAN) {
     const midBlock = fromBlock + BLOCK_SPAN;
@@ -294,8 +327,8 @@ export async function executeOpenProposal(
 ) {
   const governor = await dm.getContractOrThrow('governor');
   const blockNow = await dm.hre.ethers.provider.getBlockNumber();
-  const blocksUntilStart = startBlock - blockNow;
-  const blocksUntilEnd = endBlock - Math.max(startBlock, blockNow);
+  const blocksUntilStart = startBlock.toNumber() - blockNow;
+  const blocksUntilEnd = endBlock.toNumber() - Math.max(startBlock.toNumber(), blockNow);
 
   if (blocksUntilStart > 0) {
     await mineBlocks(dm, blocksUntilStart);
@@ -318,18 +351,19 @@ export async function executeOpenProposal(
   }
 
   // Queue proposal (maybe)
-  const state = await governor.state(id);
-  if (state == ProposalState.Succeeded) {
+  if (await governor.state(id) == ProposalState.Succeeded) {
     await setNextBaseFeeToZero(dm);
     await governor.queue(id, { gasPrice: 0 });
   }
 
-  const proposal = await governor.proposals(id);
-  await setNextBlockTimestamp(dm, proposal.eta.toNumber() + 1);
-
-  // Execute proposal (w/ gas limit so we see if exec reverts, not a gas estimation error)
-  await setNextBaseFeeToZero(dm);
-  await governor.execute(id, { gasPrice: 0, gasLimit: 12000000 });
+  // Execute proposal (maybe, w/ gas limit so we see if exec reverts, not a gas estimation error)
+  if (await governor.state(id) == ProposalState.Queued) {
+    const block = await dm.hre.ethers.provider.getBlock('latest');
+    const proposal = await governor.proposals(id);
+    await setNextBlockTimestamp(dm, Math.max(block.timestamp, proposal.eta.toNumber()) + 1);
+    await setNextBaseFeeToZero(dm);
+    await governor.execute(id, { gasPrice: 0, gasLimit: 12000000 });
+  }
 }
 
 // Instantly executes some actions through the governance proposal process
@@ -370,6 +404,7 @@ export async function fastL2GovernanceExecute(
   signatures: string[],
   calldatas: string[]
 ) {
+  const startingBlockNumber = await governanceDeploymentManager.hre.ethers.provider.getBlockNumber();
   await fastGovernanceExecute(
     governanceDeploymentManager,
     proposer,
@@ -379,7 +414,104 @@ export async function fastL2GovernanceExecute(
     calldatas
   );
 
-  await relayMessage(governanceDeploymentManager, bridgeDeploymentManager);
+  await relayMessage(governanceDeploymentManager, bridgeDeploymentManager, startingBlockNumber);
+}
+
+export async function createCrossChainProposal(context: CometContext, l2ProposalData: string, bridgeReceiver: BaseBridgeReceiver) {
+  const govDeploymentManager = context.world.auxiliaryDeploymentManager!;
+  const bridgeDeploymentManager = context.world.deploymentManager!;
+  const proposer = await context.getProposer();
+  const bridgeNetwork = bridgeDeploymentManager.network;
+  const targets: string[] = [];
+  const values: number[] = [];
+  const signatures: string[] = [];
+  const calldata: string[] = [];
+
+  // Create the chain-specific wrapper around the L2 proposal data
+  switch (bridgeNetwork) {
+    case 'arbitrum':
+    case 'arbitrum-goerli': {
+      const inbox = await govDeploymentManager.getContractOrThrow('arbitrumInbox');
+      const refundAddress = constants.AddressZero;
+      const createRetryableTicketCalldata = utils.defaultAbiCoder.encode(
+        [
+          'address', 'uint256', 'uint256', 'address', 'address', 'uint256', 'uint256', 'bytes'
+        ],
+        [
+          bridgeReceiver.address, // address to,
+          0,                      // uint256 l2CallValue,
+          0,                      // uint256 maxSubmissionCost,
+          refundAddress,          // address excessFeeRefundAddress,
+          refundAddress,          // address callValueRefundAddress,
+          0,                      // uint256 gasLimit,
+          0,                      // uint256 maxFeePerGas,
+          l2ProposalData,         // bytes calldata data
+        ]
+      );
+      targets.push(inbox.address);
+      values.push(0);
+      signatures.push('createRetryableTicket(address,uint256,uint256,address,address,uint256,uint256,bytes)');
+      calldata.push(createRetryableTicketCalldata);
+      break;
+    }
+    case 'base-goerli': {
+      const sendMessageCalldata = utils.defaultAbiCoder.encode(
+        ['address', 'bytes', 'uint32'],
+        [bridgeReceiver.address, l2ProposalData, 1_000_000] // XXX find a reliable way to estimate the gasLimit
+      );
+      const baseL1CrossDomainMessenger = await govDeploymentManager.getContractOrThrow(
+        'baseL1CrossDomainMessenger'
+      );
+
+      targets.push(baseL1CrossDomainMessenger.address);
+      values.push(0);
+      signatures.push('sendMessage(address,bytes,uint32)');
+      calldata.push(sendMessageCalldata);
+      break;
+    }
+    case 'mumbai':
+    case 'polygon': {
+      const sendMessageToChildCalldata = utils.defaultAbiCoder.encode(
+        ['address', 'bytes'],
+        [bridgeReceiver.address, l2ProposalData]
+      );
+      const fxRoot = await govDeploymentManager.getContractOrThrow('fxRoot');
+
+      targets.push(fxRoot.address);
+      values.push(0);
+      signatures.push('sendMessageToChild(address,bytes)');
+      calldata.push(sendMessageToChildCalldata);
+      break;
+    }
+    case 'linea-goerli': {
+      const sendMessageCalldata = utils.defaultAbiCoder.encode(
+        ['address', 'uint256', 'bytes'],
+        [bridgeReceiver.address, 0, l2ProposalData]
+      );
+      const lineaMessageService = await govDeploymentManager.getContractOrThrow(
+        'lineaMessageService'
+      );
+      targets.push(lineaMessageService.address);
+      values.push(0);
+      signatures.push('sendMessage(address,uint256,bytes)');
+      calldata.push(sendMessageCalldata);
+      break;
+    }
+    default:
+      throw new Error(
+        `No cross-chain proposal constructor implementation for ${govDeploymentManager.network} -> ${bridgeNetwork}`
+      );
+  }
+
+  await fastL2GovernanceExecute(
+    govDeploymentManager,
+    bridgeDeploymentManager,
+    proposer,
+    targets,
+    values,
+    signatures,
+    calldata
+  );
 }
 
 export async function executeOpenProposalAndRelay(
@@ -387,7 +519,54 @@ export async function executeOpenProposalAndRelay(
   bridgeDeploymentManager: DeploymentManager,
   openProposal: OpenProposal
 ) {
-
+  const startingBlockNumber = await governanceDeploymentManager.hre.ethers.provider.getBlockNumber();
   await executeOpenProposal(governanceDeploymentManager, openProposal);
-  await relayMessage(governanceDeploymentManager, bridgeDeploymentManager);
+
+  if (await isBridgeProposal(governanceDeploymentManager, bridgeDeploymentManager, openProposal)) {
+    await relayMessage(governanceDeploymentManager, bridgeDeploymentManager, startingBlockNumber);
+  } else {
+    console.log(
+      `[${governanceDeploymentManager.network} -> ${bridgeDeploymentManager.network}] Proposal ${openProposal.id} doesn't target bridge; not relaying`
+    );
+    return;
+  }
+}
+
+async function getLiquidationMargin({ comet, actor, baseLiquidity, factorScale }): Promise<bigint> {
+  const numAssets = await comet.numAssets();
+  let liquidity = baseLiquidity;
+  for (let i = 0; i < numAssets; i++) {
+    const { asset, priceFeed, scale, liquidateCollateralFactor } = await comet.getAssetInfo(i);
+    const collatBalance = (await comet.collateralBalanceOf(actor.address, asset)).toBigInt();
+    const collatPrice = (await comet.getPrice(priceFeed)).toBigInt();
+    const collatValue = collatBalance * collatPrice / scale.toBigInt();
+    liquidity += collatValue * liquidateCollateralFactor.toBigInt() / factorScale;
+  }
+
+  return liquidity;
+}
+
+/*
+invariant:
+((borrowRate / factorScale) * timeElapsed) * (baseBalanceOf * price / baseScale) = -liquidationMargin
+
+isolating for timeElapsed:
+timeElapsed = -liquidationMargin / (baseBalanceOf * price / baseScale) / (borrowRate / factorScale);
+*/
+export async function timeUntilUnderwater({ comet, actor, fudgeFactor = 0n }: { comet: CometInterface, actor: CometActor, fudgeFactor?: bigint }): Promise<number> {
+  const baseBalance = await actor.getCometBaseBalance();
+  const baseScale = (await comet.baseScale()).toBigInt();
+  const basePrice = (await comet.getPrice(await comet.baseTokenPriceFeed())).toBigInt();
+  const baseLiquidity = baseBalance * basePrice / baseScale;
+  const utilization = await comet.getUtilization();
+  const borrowRate = (await comet.getBorrowRate(utilization)).toBigInt();
+  const factorScale = (await comet.factorScale()).toBigInt();
+  const liquidationMargin = await getLiquidationMargin({ comet, actor, baseLiquidity, factorScale });
+
+  if (liquidationMargin < 0) {
+    return 0; // already underwater
+  }
+
+  // XXX throw error if baseBalanceOf is positive and liquidationMargin is positive
+  return Number((-liquidationMargin * factorScale / baseLiquidity / borrowRate) + fudgeFactor);
 }

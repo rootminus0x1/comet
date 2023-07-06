@@ -11,7 +11,7 @@ interface SourceTokenParameters {
   amount: number | bigint;
   asset: string;
   address: string;
-  blacklist: string[] | undefined;
+  blacklist: string[];
 }
 
 export async function fetchQuery(
@@ -57,13 +57,12 @@ export async function sourceTokens({
   blacklist,
 }: SourceTokenParameters) {
   let amount = BigNumber.from(amount_);
-
   if (amount.isZero()) {
     return;
   } else if (amount.isNegative()) {
     await removeTokens(dm, amount.abs(), asset, address);
   } else {
-    await addTokens(dm, amount, asset, address, blacklist);
+    await addTokens(dm, amount, asset, address, [address].concat(blacklist));
   }
 }
 
@@ -95,12 +94,13 @@ async function addTokens(
   amount: BigNumber,
   asset: string,
   address: string,
-  blacklist?: string[],
+  blacklist: string[],
   block?: number,
   offsetBlocks?: number,
   MAX_SEARCH_BLOCKS = 40000,
   BLOCK_SPAN = 2048
 ) {
+  // XXX we should really take min of current balance and amount and transfer that much
   let ethers = dm.hre.ethers;
   block = block ?? (await ethers.provider.getBlockNumber());
   let tokenContract = new ethers.Contract(asset, erc20, ethers.provider);

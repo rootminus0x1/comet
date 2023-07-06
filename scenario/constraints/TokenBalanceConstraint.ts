@@ -1,4 +1,4 @@
-import { Constraint } from '../../plugins/scenario';
+import { Constraint, Solution } from '../../plugins/scenario';
 import { CometContext } from '../context/CometContext';
 import { expect } from 'chai';
 import { Requirements } from './Requirements';
@@ -7,8 +7,11 @@ import { exp } from '../../test/helpers';
 import { ComparativeAmount, ComparisonOp, getActorAddressFromName, getAssetFromName, parseAmount, getToTransferAmount } from '../utils';
 
 export class TokenBalanceConstraint<T extends CometContext, R extends Requirements> implements Constraint<T, R> {
-  async solve(requirements: R, _initialContext: T) {
-    const assetsByActor = requirements.tokenBalances;
+  async solve(requirements: R, initialContext: T) {
+    let assetsByActor = requirements.tokenBalances;
+    if (typeof assetsByActor === 'function') {
+      assetsByActor = await assetsByActor(initialContext);
+    }
     if (assetsByActor) {
       const actorsByAsset = Object.entries(assetsByActor).reduce((a, [actor, assets]) => {
         return Object.entries(assets).reduce((a, [asset, rawAmount]) => {
@@ -26,7 +29,7 @@ export class TokenBalanceConstraint<T extends CometContext, R extends Requiremen
 
       // XXX ideally when properties fail
       //  we can report the names of the solution which were applied
-      const solutions = [];
+      const solutions: Solution<T>[] = [];
       solutions.push(async function barelyMeet(context: T) {
         for (const assetName in actorsByAsset) {
           const asset = await getAssetFromName(assetName, context);
@@ -42,6 +45,8 @@ export class TokenBalanceConstraint<T extends CometContext, R extends Requiremen
         return context;
       });
       return solutions;
+    } else {
+      return null;
     }
   }
 

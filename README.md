@@ -158,16 +158,21 @@ Deploys contracts to a specified chain using a deployment script.
 
 `yarn hardhat deploy --network mainnet --deployment usdc`
 
-### Run spider task
+### Spider
 
-The spider script programmatically fetches all protocol-related contracts from mainnet.
-This is just a prototype and it currently pulls relevant contracts for V2.
+Spider is a tool for programmatically fetching all protocol-related contracts from a desired network. Contracts are pulled in starting from the root set of contracts defined in `roots.json`. Then, it discovers and pulls in the web of related contracts (relations defined in `relations.json`), recursively iterating over new contracts until there are no more contracts left to discover. With spider, we can generate the comprehensive list of relevant contracts for each deployment directly from the blockchain without having to manually maintain all the addresses.
+
+Once run locally, the spider task will generate a list of all the relevant contracts for a specific deployment in a file called `aliases.json`.
+
+> Note: Spider relies on the Etherscan API to pull in contract-related info such as ABIs.
+
+#### Run spider task
 
 > Note: Make sure $ETHERSCAN_KEY is set as an env variable.
 
 `npx hardhat spider --network mainnet --deployment usdc`
 
-#### Delete artifacts
+#### Delete spider artifacts
 
 You can delete all spider artifacts using the `--clean` flag:
 
@@ -238,7 +243,7 @@ These simulations are extremely useful for testing deployments before actually c
 Source code verification is a relatively important part of deployments currently.
 The 'spider' tool we use to crawl relevant addresses from the root addresses by default relies on pulling verified contract ABIs.
 Verification happens normally as part of the deploy command-line task (the same command triggered by the `deploy-market` workflow).
-Since deployments are idempotent by default, the deploy command can also be used to *just* verify the existing contracts.
+Since deployments are idempotent by default, the deploy command can also be used to *just* verify the existing contracts (an explicit way to do this is via the `--no-deploy` flag).
 When all contracts are already deployed, the only actions performed will be to verify the contracts remaining in the verification cache.
 The script *always* attempts to verify the Comet implementation contract, since this is deployed via a factory and the status is relatively unknown to it.
 
@@ -248,7 +253,15 @@ This can also be used together with `--overwrite`, to produce the verification a
 #### Other considerations
 
 Make sure that the deploying address has a sufficient amount of the chain's
-native asset (i.e. 2 ETH for Kovan, 2 AVAX for Fuji)
+native asset (i.e. 2 ETH for Goerli, 2 AVAX for Fuji)
+
+### Clone Multisig
+
+The `clone-multisig` script can be used to clone the multisig and its configuration from an existing deployment, e.g.:
+
+```bash
+DST_NETWORK=optimism-goerli npx hardhat run scripts/clone-multisig.ts
+```
 
 ### Liquidation Bot
 
@@ -259,7 +272,7 @@ Uniswap for a profit.
 To run the bot, you'll need the address of a deployed version of the Liquidator
 contract (or you can deploy a new instance of it yourself):
 
-`LIQUIDATOR_ADDRESS="0xABC..." DEPLOYMENT="usdc" yarn liquidation-bot --network kovan`
+`LIQUIDATOR_ADDRESS="0xABC..." DEPLOYMENT="usdc" yarn liquidation-bot --network goerli`
 
 Initiating transactions this way via the public mempool will
 [almost certainly get frontrun](https://youtu.be/UZ-NNd6yjFM), but you might be

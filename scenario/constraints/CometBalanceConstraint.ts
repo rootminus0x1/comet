@@ -1,4 +1,4 @@
-import { Constraint } from '../../plugins/scenario';
+import { Constraint, Solution } from '../../plugins/scenario';
 import { CometContext } from '../context/CometContext';
 import CometActor from '../context/CometActor';
 import { expect } from 'chai';
@@ -33,8 +33,12 @@ async function borrowBase(borrowActor: CometActor, toBorrowBase: bigint, context
 }
 
 export class CometBalanceConstraint<T extends CometContext, R extends Requirements> implements Constraint<T, R> {
-  async solve(requirements: R, _initialContext: T) {
-    const assetsByActor = requirements.cometBalances;
+  async solve(requirements: R, initialContext: T) {
+    let assetsByActor = requirements.cometBalances;
+    if (typeof assetsByActor === 'function') {
+      assetsByActor = await assetsByActor(initialContext);
+    }
+
     if (assetsByActor) {
       const actorsByAsset = Object.entries(assetsByActor).reduce((a, [actor, assets]) => {
         return Object.entries(assets).reduce((a, [asset, rawAmount]) => {
@@ -52,7 +56,7 @@ export class CometBalanceConstraint<T extends CometContext, R extends Requiremen
 
       // XXX ideally when properties fail
       //  we can report the names of the solution which were applied
-      const solutions = [];
+      const solutions: Solution<T>[] = [];
       solutions.push(async function barelyMeet(context: T) {
         const comet = await context.getComet();
         for (const assetName in actorsByAsset) {
@@ -96,6 +100,8 @@ export class CometBalanceConstraint<T extends CometContext, R extends Requiremen
         return context;
       });
       return solutions;
+    } else {
+      return null;
     }
   }
 

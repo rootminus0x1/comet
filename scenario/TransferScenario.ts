@@ -1,9 +1,9 @@
 import { CometContext, scenario } from './context/CometContext';
 import { expect } from 'chai';
-import { expectApproximately, expectRevertCustom, getExpectedBaseBalance, getInterest, isTriviallySourceable, isValidAssetIndex, MAX_ASSETS } from './utils';
+import { expectApproximately, expectBase, expectRevertCustom, getInterest, isTriviallySourceable, isValidAssetIndex, MAX_ASSETS } from './utils';
 import { ContractReceipt } from 'ethers';
 
-async function testTransferCollateral(context: CometContext, assetNum: number): Promise<null | ContractReceipt> {
+async function testTransferCollateral(context: CometContext, assetNum: number): Promise<void | ContractReceipt> {
   const comet = await context.getComet();
   const { albert, betty } = context.actors;
   const { asset: assetAddress, scale } = await comet.getAssetInfo(assetNum);
@@ -19,7 +19,7 @@ async function testTransferCollateral(context: CometContext, assetNum: number): 
   return txn; // return txn to measure gas
 }
 
-async function testTransferFromCollateral(context: CometContext, assetNum: number): Promise<null | ContractReceipt> {
+async function testTransferFromCollateral(context: CometContext, assetNum: number): Promise<void | ContractReceipt> {
   const comet = await context.getComet();
   const { albert, betty, charles } = context.actors;
   const { asset: assetAddress, scale } = await comet.getAssetInfo(assetNum);
@@ -80,20 +80,14 @@ scenario(
     const { albert, betty } = actors;
     const baseAssetAddress = await comet.baseToken();
     const baseAsset = context.getAssetByAddress(baseAssetAddress);
-    const scale = (await comet.baseScale()).toBigInt();
+    const baseSupplied = (await comet.balanceOf(albert.address)).toBigInt();
 
-    // Albert transfers 50 units of base to Betty
-    const toTransfer = 50n * scale;
+    // Albert transfers half supplied base to Betty
+    const toTransfer = baseSupplied / 2n;
     const txn = await albert.transferAsset({ dst: betty.address, asset: baseAsset.address, amount: toTransfer });
 
-    const baseIndexScale = (await comet.baseIndexScale()).toBigInt();
-    const baseSupplyIndex = (await comet.totalsBasic()).baseSupplyIndex.toBigInt();
-    const baseSupplied = getExpectedBaseBalance(100n * scale, baseIndexScale, baseSupplyIndex);
-    const baseTransferred = getExpectedBaseBalance(50n * scale, baseIndexScale, baseSupplyIndex);
-    const baseOfTransferrer = getExpectedBaseBalance(baseSupplied - toTransfer, baseIndexScale, baseSupplyIndex);
-
-    expect(await comet.balanceOf(albert.address)).to.be.equal(baseOfTransferrer);
-    expect(await comet.balanceOf(betty.address)).to.be.equal(baseTransferred);
+    expectBase(await albert.getCometBaseBalance(), baseSupplied - toTransfer, baseSupplied / 100n);
+    expectBase(await betty.getCometBaseBalance(), toTransfer, baseSupplied / 100n);
 
     return txn; // return txn to measure gas
   }

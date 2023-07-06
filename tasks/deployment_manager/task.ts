@@ -25,7 +25,7 @@ function getDefaultDeployment(config: HardhatConfig, network: string): string {
 
 async function runMigration<T>(
   deploymentManager: DeploymentManager,
-  governanceDeploymentManager: DeploymentManager,
+  govDeploymentManager: DeploymentManager,
   prepare: boolean,
   enact: boolean,
   migration: Migration<T>,
@@ -40,7 +40,7 @@ async function runMigration<T>(
     }
 
     console.log('Running preparation step...');
-    artifact = await migration.actions.prepare(deploymentManager);
+    artifact = await migration.actions.prepare(deploymentManager, govDeploymentManager);
     console.log('Preparation artifact', artifact);
     let outputFile = await deploymentManager.storeArtifact(migration, artifact);
     if (deploymentManager.cache.writeCacheToDisk) {
@@ -52,7 +52,7 @@ async function runMigration<T>(
 
   if (enact) {
     console.log('Running enactment step with artifact...', artifact);
-    await migration.actions.enact(governanceDeploymentManager, artifact);
+    await migration.actions.enact(deploymentManager, govDeploymentManager, artifact);
     console.log('Enactment complete');
   }
 }
@@ -81,10 +81,14 @@ task('deploy', 'Deploys market')
     if (noDeploy) {
       // Don't run the deploy script
     } else {
-      const overrides = undefined; // TODO: pass through cli args
-      const delta = await dm.runDeployScript(overrides ?? { allMissing: true });
-      console.log(`[${tag}] Deployed ${dm.counter} contracts, spent ${dm.spent} Ξ`);
-      console.log(`[${tag}]\n${dm.diffDelta(delta)}`);
+      try {
+        const overrides = undefined; // TODO: pass through cli args
+        const delta = await dm.runDeployScript(overrides ?? { allMissing: true });
+        console.log(`[${tag}] Deployed ${dm.counter} contracts, spent ${dm.spent} Ξ`);
+        console.log(`[${tag}]\n${dm.diffDelta(delta)}`);
+      } catch (e) {
+        console.log(`[${tag}] Failed to deploy with error: ${e}`);
+      }
     }
 
     const verify = noVerify ? false : !simulate;
@@ -178,7 +182,7 @@ task('migrate', 'Runs migration')
         maybeForkEnv,
         {
           writeCacheToDisk: !simulate || overwrite, // Don't write to disk when simulating, unless overwrite is set
-          verificationStrategy: 'lazy',
+          verificationStrategy: 'eager', // We use eager here to verify contracts right after they are deployed
         }
       );
       await dm.spider();
@@ -196,7 +200,7 @@ task('migrate', 'Runs migration')
           governanceEnv,
           {
             writeCacheToDisk: !simulate || overwrite, // Don't write to disk when simulating, unless overwrite is set
-            verificationStrategy: 'lazy',
+            verificationStrategy: 'eager', // We use eager here to verify contracts right after they are deployed
           }
         );
         await governanceDm.spider();

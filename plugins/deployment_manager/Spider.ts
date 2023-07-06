@@ -17,7 +17,7 @@ import { Address, Alias, BuildFile, TraceFn } from './Types';
 import { Aliases } from './Aliases';
 import { ContractMap } from './ContractMap';
 import { Roots } from './Roots';
-import { asArray, debug, getEthersContract, mergeABI } from './Utils';
+import { asArray, debug, getEthersContract, mergeContracts } from './Utils';
 import { fetchAndCacheContract, readContract } from './Import';
 
 export interface Spider {
@@ -125,14 +125,7 @@ async function crawl(
 
           // Extend the contract ABI w/ the delegate
           //trace(`Merging ${address} <- ${implNode.address} (${alias} <- ${implAlias})`);
-          contract = new hre.ethers.Contract(
-            address,
-            mergeABI(
-              implContract.interface.format('json'),
-              contract.interface.format('json')
-            ),
-            hre.ethers.provider
-          );
+          contract = mergeContracts(address, [implContract, contract], hre);
 
           // Add the alias in place to the relative context
           (context[implAlias] = context[implAlias] || []).push(implContract);
@@ -173,10 +166,10 @@ async function crawl(
 
   const addressConfig = relations[address.toLowerCase()];
   if (addressConfig) {
-    //trace(' ... has an address config (${address})');
+    //trace(` ... has an address config (${address})`);
     if (addressConfig.artifact) {
       //trace(`  ... has artifact specified (${addressConfig.artifact})`);
-      const build = await localBuild(cache, hre, addressConfig.artifact, network, address);
+      const build = await localBuild(null, hre, addressConfig.artifact, network, address);
       const alias = await readAlias(build.contract, aliasRender, context, path);
       return maybeProcess(alias, build, addressConfig);
     } else {
@@ -196,7 +189,7 @@ async function crawl(
     // }
     if (aliasTemplateConfig.artifact) {
       //trace(`  ... has artifact specified (${aliasTemplateConfig.artifact})`);
-      const build = await localBuild(cache, hre, aliasTemplateConfig.artifact, network, address);
+      const build = await localBuild(null, hre, aliasTemplateConfig.artifact, network, address);
       const alias = await readAlias(build.contract, aliasRender, context, path);
       return maybeProcess(alias, build, aliasTemplateConfig);
     } else {

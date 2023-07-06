@@ -5,19 +5,20 @@ import {
   CometExt__factory,
   CometHarness__factory,
   CometHarnessInterface,
-  Liquidator__factory
+  OnChainLiquidator__factory
 } from '../../build/types';
 import {
+  BALANCER_VAULT,
   COMP,
   COMP_USDC_PRICE_FEED,
   COMP_WHALE,
   DAI,
-  DAI_USDC_PRICE_FEED,
   DAI_WHALE,
   LINK,
   LINK_USDC_PRICE_FEED,
   LINK_WHALE,
-  SWAP_ROUTER,
+  ST_ETH,
+  UNISWAP_ROUTER,
   UNI,
   UNI_USDC_PRICE_FEED,
   UNI_WHALE,
@@ -30,7 +31,9 @@ import {
   WETH9,
   ETH_USDC_PRICE_FEED,
   WETH_WHALE,
-  UNISWAP_V3_FACTORY
+  WST_ETH,
+  UNISWAP_V3_FACTORY,
+  SUSHISWAP_ROUTER
 } from './addresses';
 import daiAbi from './dai-abi';
 import usdcAbi from './usdc-abi';
@@ -40,7 +43,14 @@ import uniAbi from './uni-abi';
 import compAbi from './comp-abi';
 import linkAbi from './link-abi';
 
-export default async function makeLiquidatableProtocol() {
+export enum Exchange {
+  Uniswap,
+  SushiSwap,
+  Balancer,
+  Curve
+}
+
+export async function makeProtocol() {
   // build Comet
   const CometExtFactory = (await ethers.getContractFactory('CometExt')) as CometExt__factory;
   const name32 = ethers.utils.formatBytes32String('Compound Comet');
@@ -69,17 +79,8 @@ export default async function makeLiquidatableProtocol() {
     baseTrackingBorrowSpeed: exp(1, 15),
     baseMinForRewards: exp(1, 6),
     baseBorrowMin: exp(1, 6),
-    targetReserves: exp(1, 18),
+    targetReserves: exp(5_000_000, 6),
     assetConfigs: [
-      {
-        asset: DAI,
-        priceFeed: DAI_USDC_PRICE_FEED,
-        decimals: 18,
-        borrowCollateralFactor: 999999999999999999n,
-        liquidateCollateralFactor: exp(1, 18),
-        liquidationFactor: exp(0.9, 18),
-        supplyCap: exp(1000000, 18)
-      },
       {
         asset: COMP,
         priceFeed: COMP_USDC_PRICE_FEED,
@@ -87,7 +88,7 @@ export default async function makeLiquidatableProtocol() {
         borrowCollateralFactor: 999999999999999999n,
         liquidateCollateralFactor: exp(1, 18),
         liquidationFactor: exp(0.9, 18),
-        supplyCap: exp(100, 18)
+        supplyCap: exp(1000000, 18)
       },
       {
         asset: WBTC,
@@ -132,36 +133,18 @@ export default async function makeLiquidatableProtocol() {
   await comet.deployed();
   const cometHarnessInterface = await ethers.getContractAt('CometHarnessInterface', comet.address) as CometHarnessInterface;
 
-  // configure Comet
-  await setTotalsBasic(cometHarnessInterface, {
-    baseBorrowIndex: 2e15,
-    baseSupplyIndex: 2e15,
-    totalSupplyBase: 2e13,
-    totalBorrowBase: 2e13
-  });
+  const [signer,, recipient] = await ethers.getSigners();
 
-  // create underwater user
-  const [signer, underwaterUser, recipient] = await ethers.getSigners();
-
-  // build Liquidator
-  const Liquidator = await ethers.getContractFactory('Liquidator') as Liquidator__factory;
-  const liquidator = await Liquidator.deploy(
-    recipient.address,
-    ethers.utils.getAddress(SWAP_ROUTER),
-    ethers.utils.getAddress(comet.address),
-    ethers.utils.getAddress(UNISWAP_V3_FACTORY),
-    ethers.utils.getAddress(WETH9),
-    10e6, // min viable liquidation is for 10 USDC (base token) of collateral,
-    [
-      ethers.utils.getAddress(DAI),
-      ethers.utils.getAddress(WETH9),
-      ethers.utils.getAddress(WBTC),
-      ethers.utils.getAddress(UNI),
-      ethers.utils.getAddress(COMP),
-      ethers.utils.getAddress(LINK)
-    ],
-    [false, false, false, false, true, true],
-    [500, 500, 3000, 3000, 3000, 3000]
+  // build OnChainLiquidator
+  const OnChainLiquidator = await ethers.getContractFactory('OnChainLiquidator') as OnChainLiquidator__factory;
+  const liquidator = await OnChainLiquidator.deploy(
+    BALANCER_VAULT,
+    SUSHISWAP_ROUTER,
+    UNISWAP_ROUTER,
+    UNISWAP_V3_FACTORY,
+    ST_ETH,
+    WST_ETH,
+    WETH9
   );
   await liquidator.deployed();
 
@@ -215,24 +198,10 @@ export default async function makeLiquidatableProtocol() {
   });
   const linkWhaleSigner = await ethers.getSigner(LINK_WHALE);
 
-  await mockUSDC.connect(usdcWhaleSigner).transfer(signer.address, exp(300, 6));
-  // transfer DAI to underwater user
-  await mockDai.connect(daiWhaleSigner).transfer(underwaterUser.address, exp(200, 18));
-  // transfer WETH to underwater user
-  await mockWETH.connect(wethWhaleSigner).transfer(underwaterUser.address, exp(200, 18));
-  // transfer WBTC to underwater user
-  await mockWBTC.connect(wbtcWhaleSigner).transfer(underwaterUser.address, exp(2, 8));
-  // transfer UNI to underwater user
-  await mockUNI.connect(uniWhaleSigner).transfer(underwaterUser.address, exp(200, 18));
-  // transfer COMP to underwater user
-  await mockCOMP.connect(compWhaleSigner).transfer(underwaterUser.address, exp(200, 18));
-  // transfer LINK to underwater user
-  await mockLINK.connect(linkWhaleSigner).transfer(underwaterUser.address, exp(200, 18));
-
   return {
     comet: cometHarnessInterface,
     liquidator,
-    users: [signer, underwaterUser, recipient],
+    users: [signer, recipient],
     assets: {
       dai: mockDai,
       usdc: mockUSDC,
@@ -250,6 +219,64 @@ export default async function makeLiquidatableProtocol() {
       uniWhale: uniWhaleSigner,
       compWhale: compWhaleSigner,
       linkWhale: linkWhaleSigner,
+    }
+  };
+}
+
+export async function makeLiquidatableProtocol() {
+  const {
+    comet,
+    liquidator,
+    assets: { dai, usdc, weth, wbtc, uni, comp, link  },
+    whales: { daiWhale, usdcWhale, wethWhale, wbtcWhale, uniWhale, compWhale, linkWhale }
+  } = await makeProtocol();
+
+  // configure Comet
+  await setTotalsBasic(comet, {
+    baseBorrowIndex: 2e15,
+    baseSupplyIndex: 2e15,
+    totalSupplyBase: 2e11,
+    totalBorrowBase: 2e11
+  });
+
+  // create underwater user
+  const [signer, underwaterUser, recipient] = await ethers.getSigners();
+
+  await usdc.connect(usdcWhale).transfer(signer.address, exp(300, 6));
+  // transfer DAI to underwater user
+  await dai.connect(daiWhale).transfer(underwaterUser.address, exp(200, 18));
+  // transfer WETH to underwater user
+  await weth.connect(wethWhale).transfer(underwaterUser.address, exp(200, 18));
+  // transfer WBTC to underwater user
+  await wbtc.connect(wbtcWhale).transfer(underwaterUser.address, exp(2, 8));
+  // transfer UNI to underwater user
+  await uni.connect(uniWhale).transfer(underwaterUser.address, exp(200, 18));
+  // transfer COMP to underwater user
+  await comp.connect(compWhale).transfer(underwaterUser.address, exp(200, 18));
+  // transfer LINK to underwater user
+  await link.connect(linkWhale).transfer(underwaterUser.address, exp(200, 18));
+
+  return {
+    comet: comet,
+    liquidator,
+    users: [signer, underwaterUser, recipient],
+    assets: {
+      dai,
+      usdc,
+      weth,
+      wbtc,
+      uni,
+      comp,
+      link
+    },
+    whales: {
+      daiWhale,
+      usdcWhale,
+      wethWhale,
+      wbtcWhale,
+      uniWhale,
+      compWhale,
+      linkWhale,
     }
   };
 }

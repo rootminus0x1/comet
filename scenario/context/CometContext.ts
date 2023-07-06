@@ -1,17 +1,19 @@
-import { BigNumberish } from 'ethers';
-import { World, buildScenarioFn } from '../../plugins/scenario';
+import { BigNumber, BigNumberish } from 'ethers';
+import { Loader, World, debug } from '../../plugins/scenario';
 import { Migration } from '../../plugins/deployment_manager';
-import { debug } from '../../plugins/deployment_manager/Utils';
 import {
+  NativeTokenConstraint,
   TokenBalanceConstraint,
   ModernConstraint,
   PauseConstraint,
   UtilizationConstraint,
+  SupplyCapConstraint,
   CometBalanceConstraint,
   MigrationConstraint,
-  VerifyMigrationConstraint,
   ProposalConstraint,
   FilterConstraint,
+  PriceConstraint,
+  ReservesConstraint
 } from '../constraints';
 import CometActor from './CometActor';
 import CometAsset from './CometAsset';
@@ -24,18 +26,27 @@ import {
   IGovernorBravo,
   CometRewards,
   Fauceteer,
-  Bulker,
+  BaseBulker,
   BaseBridgeReceiver,
+  ERC20,
 } from '../../build/types';
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers';
 import { sourceTokens } from '../../plugins/scenario/utils/TokenSourcer';
-import { ProtocolConfiguration, deployComet, COMP_WHALES } from '../../src/deploy';
+import { ProtocolConfiguration, deployComet, COMP_WHALES, WHALES } from '../../src/deploy';
 import { AddressLike, getAddressFromNumber, resolveAddress } from './Address';
+import { fastGovernanceExecute, max, mineBlocks, setNextBaseFeeToZero, setNextBlockTimestamp } from '../utils';
+import { DynamicConstraint, StaticConstraint } from '../../plugins/scenario/Scenario';
 import { Requirements } from '../constraints/Requirements';
-import { fastGovernanceExecute, mineBlocks, setNextBaseFeeToZero, setNextBlockTimestamp } from '../utils';
 
 export type ActorMap = { [name: string]: CometActor };
 export type AssetMap = { [name: string]: CometAsset };
+export type MigrationData = {
+  migration: Migration<any>;
+  lastProposal?: number;
+  preMigrationBlockNumber?: number;
+  skipVerify?: boolean;
+  verified?: boolean;
+}
 
 export interface CometProperties {
   actors: ActorMap;
@@ -46,7 +57,7 @@ export interface CometProperties {
   timelock: SimpleTimelock;
   governor: IGovernorBravo;
   rewards: CometRewards;
-  bulker: Bulker;
+  bulker: BaseBulker;
   bridgeReceiver: BaseBridgeReceiver;
 }
 
@@ -54,7 +65,7 @@ export class CometContext {
   world: World;
   actors: ActorMap;
   assets: AssetMap;
-  migrations?: Migration<any>[];
+  migrations?: MigrationData[];
 
   constructor(world: World) {
     this.world = world;
@@ -63,11 +74,24 @@ export class CometContext {
   }
 
   async getCompWhales(): Promise<string[]> {
-    return COMP_WHALES[this.world.base.name === 'mainnet' ? 'mainnet' : 'testnet'];
+    const useMainnetComp = ['mainnet', 'polygon', 'arbitrum'].includes(this.world.base.network);
+    return COMP_WHALES[useMainnetComp ? 'mainnet' : 'testnet'];
+  }
+
+  async getWhales(): Promise<string[]> {
+    const whales: string[] = [];
+    const fauceteer = await this.getFauceteer();
+    if (fauceteer)
+      whales.push(fauceteer.address);
+    return whales.concat(WHALES[this.world.base.network] || []);
   }
 
   async getProposer(): Promise<SignerWithAddress> {
-    return this.world.impersonateAddress((await this.getCompWhales())[0], 10n ** 18n);
+    return this.world.impersonateAddress((await this.getCompWhales())[0], { value: 10n ** 18n, onGovNetwork: true });
+  }
+
+  async getComp(): Promise<ERC20> {
+    return this.world.deploymentManager.contract('COMP');
   }
 
   async getComet(): Promise<CometInterface> {
@@ -94,7 +118,13 @@ export class CometContext {
     return this.world.deploymentManager.contract('rewards');
   }
 
-  async getBulker(): Promise<Bulker> {
+  async getRewardToken(): Promise<ERC20> {
+    const signer = await this.world.deploymentManager.getSigner();
+    const { token } = await this.getRewardConfig();
+    return ERC20__factory.connect(token, signer);
+  }
+
+  async getBulker(): Promise<BaseBulker> {
     return this.world.deploymentManager.contract('bulker');
   }
 
@@ -112,11 +142,17 @@ export class CometContext {
     return configurator.getConfiguration(comet.address);
   }
 
+  async getRewardConfig(): Promise<{token: string, rescaleFactor: BigNumber, shouldUpscale: boolean}> {
+    const comet = await this.getComet();
+    const rewards = await this.getRewards();
+    return await rewards.rewardConfig(comet.address);
+  }
+
   async upgrade(configOverrides: ProtocolConfiguration): Promise<CometContext> {
     const { world } = this;
 
     const oldComet = await this.getComet();
-    const admin = await world.impersonateAddress(await oldComet.governor(), 10n ** 18n);
+    const admin = await world.impersonateAddress(await oldComet.governor(), { value: 20n ** 18n });
 
     const deploySpec = { cometMain: true, cometExt: true };
     const deployed = await deployComet(this.world.deploymentManager, deploySpec, configOverrides, admin);
@@ -127,6 +163,37 @@ export class CometContext {
     debug('Upgraded comet...');
 
     return this;
+  }
+
+  async changePriceFeeds(newPrices: Record<string, number>) {
+    const comet = await this.getComet();
+    const baseToken = await comet.baseToken();
+
+    const newPriceFeeds: Record<string, string> = {};
+    for (const assetAddress in newPrices) {
+      const assetName = this.getAssetByAddress(assetAddress)[0];
+      const priceFeed = await this.world.deploymentManager.deploy(
+        `${assetName}:priceFeed`,
+        'test/SimplePriceFeed.sol',
+        [newPrices[assetAddress] * 1e8, 8],
+        true
+      );
+      newPriceFeeds[assetAddress] = priceFeed.address;
+    }
+
+    const gov = await this.world.impersonateAddress(await comet.governor(), { value: 10n ** 18n });
+    const cometAdmin = (await this.getCometAdmin()).connect(gov);
+    const configurator = (await this.getConfigurator()).connect(gov);
+    for (const [assetAddress, priceFeedAddress] of Object.entries(newPriceFeeds)) {
+      if (assetAddress === baseToken) {
+        debug(`Setting base token price feed to ${priceFeedAddress}`);
+        await configurator.setBaseTokenPriceFeed(comet.address, priceFeedAddress);
+      } else {
+        debug(`Setting ${assetAddress} price feed to ${priceFeedAddress}`);
+        await configurator.updateAssetPriceFeed(comet.address, assetAddress, priceFeedAddress);
+      }
+    }
+    await cometAdmin.deployAndUpgradeTo(configurator.address, comet.address);
   }
 
   async bumpSupplyCaps(supplyAmountPerAsset: Record<string, bigint>) {
@@ -143,14 +210,15 @@ export class CometContext {
         const newTotalSupply = currentTotalSupply + supplyAmountPerAsset[asset];
         if (newTotalSupply > assetInfo.supplyCap.toBigInt()) {
           shouldUpgrade = true;
-          newSupplyCaps[asset] = newTotalSupply * 2n;
+          newSupplyCaps[asset] = max(newTotalSupply * 2n, assetInfo.scale.toBigInt());
         }
       }
     }
 
     // Set new supply caps in Configurator and do a deployAndUpgradeTo
     if (shouldUpgrade) {
-      const gov = await this.world.impersonateAddress(await comet.governor(), 10n ** 18n);
+      debug(`Bumping supply caps...`, comet.address, newSupplyCaps);
+      const gov = await this.world.impersonateAddress(await comet.governor(), { value: 10n ** 18n });
       const cometAdmin = (await this.getCometAdmin()).connect(gov);
       const configurator = (await this.getConfigurator()).connect(gov);
       for (const [asset, cap] of Object.entries(newSupplyCaps)) {
@@ -160,13 +228,13 @@ export class CometContext {
     }
   }
 
-  async allocateActor(name: string, info: object = {}): Promise<CometActor> {
+  async allocateActor(name: string): Promise<CometActor> {
     const { world } = this;
     const { signer } = this.actors;
 
     const actorAddress = getAddressFromNumber(Object.keys(this.actors).length + 1);
     const actorSigner = await world.impersonateAddress(actorAddress);
-    const actor: CometActor = new CometActor(name, actorSigner, actorAddress, this, info);
+    const actor: CometActor = new CometActor(name, actorSigner, actorAddress, this);
     this.actors[name] = actor;
 
     // When we allocate a new actor, how much eth should we warm the account with?
@@ -188,45 +256,39 @@ export class CometContext {
 
   async sourceTokens(amount: number | bigint, asset: CometAsset | string, recipient: AddressLike) {
     const { world } = this;
+    const recipientAddress = resolveAddress(recipient);
+    const cometAsset = typeof asset === 'string' ? this.getAssetByAddress(asset) : asset;
+    const comet = await this.getComet();
 
-    let recipientAddress = resolveAddress(recipient);
-    let cometAsset = typeof asset === 'string' ? this.getAssetByAddress(asset) : asset;
-    let comet = await this.getComet();
+    let amountRemaining = BigInt(amount);
 
-    // First, try to source from Fauceteer
-    const fauceteer = await this.getFauceteer();
-    const fauceteerBalance = fauceteer ? await cometAsset.balanceOf(fauceteer.address) : 0;
-    if (amount >= 0 && fauceteerBalance > amount) {
-      debug(`Source Tokens: stealing from fauceteer`, amount, cometAsset.address);
-      const fauceteerSigner = await world.impersonateAddress(fauceteer.address);
-      const fauceteerActor = await buildActor('fauceteerActor', fauceteerSigner, this);
-      // make gas fee 0 so we can source from contract addresses as well as EOAs
-      await this.setNextBaseFeeToZero();
-      await cometAsset.transfer(fauceteerActor, amount, recipientAddress, { gasPrice: 0 });
-      return;
-    }
-
-    // Second, try to steal from a known actor
-    for (let [name, actor] of Object.entries(this.actors)) {
-      let actorBalance = await cometAsset.balanceOf(actor);
-      if (amount >= 0 && actorBalance > amount) {
-        debug(`Source Tokens: stealing from actor ${name}`, amount, cometAsset.address);
+    // Try to steal from a known whale
+    for (const whale of await this.getWhales()) {
+      const signer = await world.impersonateAddress(whale);
+      const balance = await cometAsset.balanceOf(whale);
+      const amountToTake = balance > amountRemaining ? amountRemaining : balance;
+      if (amountToTake > 0n) {
+        debug(`Source Tokens: stealing from whale ${whale}`, amountToTake, cometAsset.address);
         // make gas fee 0 so we can source from contract addresses as well as EOAs
         await this.setNextBaseFeeToZero();
-        await cometAsset.transfer(actor, amount, recipientAddress, { gasPrice: 0 });
-        return;
+        await cometAsset.transfer(signer, amountToTake, recipientAddress, { gasPrice: 0 });
+        amountRemaining -= amountToTake;
       }
+      if (amountRemaining <= 0n)
+        break;
     }
 
-    // Third, source from logs (expensive, in terms of node API limits)
-    debug('Source Tokens: sourcing from logs...', amount, cometAsset.address);
-    await sourceTokens({
-      dm: this.world.deploymentManager,
-      amount,
-      asset: cometAsset.address,
-      address: recipientAddress,
-      blacklist: [comet.address],
-    });
+    if (amountRemaining != 0n) {
+      // Source from logs (expensive, in terms of node API limits)
+      debug('Source Tokens: sourcing from logs...', amountRemaining, cometAsset.address);
+      await sourceTokens({
+        dm: this.world.deploymentManager,
+        amount: amountRemaining,
+        asset: cometAsset.address,
+        address: recipientAddress,
+        blacklist: [comet.address],
+      });
+    }
   }
 
   async setActors(actors?: { [name: string]: CometActor }) {
@@ -299,18 +361,20 @@ async function getActors(context: CometContext): Promise<{ [name: string]: Comet
 async function getAssets(context: CometContext): Promise<{ [symbol: string]: CometAsset }> {
   const { deploymentManager } = context.world;
 
-  let comet = await context.getComet();
-  let signer = await deploymentManager.getSigner();
-  let numAssets = await comet.numAssets();
-  let assetAddresses = [
+  const COMP = await context.getComp();
+  const comet = await context.getComet();
+  const signer = await deploymentManager.getSigner();
+  const numAssets = await comet.numAssets();
+  const assetAddresses = [
     await comet.baseToken(),
     ...await Promise.all(Array(numAssets).fill(0).map(async (_, i) => {
       return (await comet.getAssetInfo(i)).asset;
     })),
+    ...(COMP ? [COMP.address] : []),
   ];
 
   return Object.fromEntries(await Promise.all(assetAddresses.map(async (address) => {
-    let erc20 = ERC20__factory.connect(address, signer);
+    const erc20 = ERC20__factory.connect(address, signer);
     return [await erc20.symbol(), new CometAsset(erc20)];
   })));
 }
@@ -337,25 +401,27 @@ async function getContextProperties(context: CometContext): Promise<CometPropert
   };
 }
 
-async function forkContext(c: CometContext, w: World): Promise<CometContext> {
-  let context = new CometContext(w);
-  // We need to reconstruct the actors using the new deployment manager. Otherwise,
-  // the new actors will be using the old NonceManagers from the old deployment manager.
-  await context.setActors();
-  await context.setAssets(Object.entries(c.assets).reduce((a, [name, asset]) => ({ ...a, [name]: CometAsset.fork(asset) }), {}));
-  return context;
-}
-
-export const constraints = [
-  new FilterConstraint(),
+export const staticConstraints: StaticConstraint<CometContext>[] = [
+  new NativeTokenConstraint(),
   new MigrationConstraint(),
   new ProposalConstraint(),
-  new VerifyMigrationConstraint(),
+];
+
+export const dynamicConstraints: DynamicConstraint<CometContext, Requirements>[] = [
+  new FilterConstraint(),
   new ModernConstraint(),
   new PauseConstraint(),
+  new SupplyCapConstraint(),
   new CometBalanceConstraint(),
   new TokenBalanceConstraint(),
   new UtilizationConstraint(),
+  new PriceConstraint(),
+  new ReservesConstraint()
 ];
 
-export const scenario = buildScenarioFn<CometContext, CometProperties, Requirements>(getInitialContext, getContextProperties, forkContext, constraints);
+export const scenarioLoader = Loader.get<CometContext, CometProperties, Requirements>().configure(
+  staticConstraints,
+  getInitialContext,
+  getContextProperties,
+);
+export const scenario = scenarioLoader.scenarioFun(dynamicConstraints);
